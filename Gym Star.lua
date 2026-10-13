@@ -10,11 +10,15 @@ if old and type(old.Unload)=='function' then pcall(old.Unload) end
 env.PuckAFK_GymStar_ResumeUniverse=tonumber(game.GameId)
 env.PuckAFK_GymStar_ResumeMaster=false
 env.PuckAFK_GymStar_ResumeSource=[===[--[[
-    PuckAFK Gym Star Simulator | Smart Autofarm v1.6.4
+    PuckAFK Gym Star Simulator | Smart Autofarm v1.6.7
     Place ID: 70906625936847
     Source-based implementation researched from the user's 2026-10-13 RBXL and gameplay remote log.
     NOT live tested; multiplayer/server behavior and executor support may differ.
-    v1.6.4: put Unload in Settings and restore a dedicated Configs tab with saved profiles (no raw JSON).
+    v1.6.7: fast-rank shop optimizer, normal-coin growth-coach purchases,
+    owned power/stamina boosts, and rank-first hatch scheduling.
+    v1.6.6: immediate Profile Rank Up and eligible full Rebirth, independent of champion-first training holds; verification and spam protection.
+    v1.6.5: stable fast training sessions, reduced unnecessary travel/egg interruptions, improved stamina recovery.
+    v1.6.4: Unload in Settings and a simple Configs tab without raw JSON.
     v1.6.2: hide the raw JSON/Configs tab; executor-aware auto resume after teleport.
     v1.6.1: clean beginner-friendly UI with Home, Autofarm and Settings.
     Preserves all v1.6.0 farming, safety, progress and persistence systems.
@@ -166,7 +170,7 @@ local state = {
     WeightPriority = 'Heaviest Weights',
     Balanced = 'Rebirth Needs',
     AllowFree = true,
-    TrainClicksPerSecond = 10,
+    TrainClicksPerSecond = 10, -- Native client trains at roughly 0.1-second intervals.
     StaminaTraining = true,
     StaminaMinShare = 12,
     AutoRecovery = true,
@@ -174,12 +178,15 @@ local state = {
     EnergyLowPercent = 25,
     EnergyResumePercent = 75,
     EnergyClickReserve = 3,
-    EnergyCostBudgetPercent = 10,
+    EnergyCostBudgetPercent = 8, -- Prevent exhausting stamina immediately with unnecessarily heavy weights.
     RecoveryTreadmillSeconds = 16,
     RecoveryRestSeconds = 18,
     ReselectSeconds = 35,
+    FastTraining = true,
+    FastMachineLockSeconds = 240, -- Prefer a useful, established training machine for four minutes.
+    EggBreakSeconds = 600, -- Egg hatching is opportunistic; avoid interrupting productive reps.
     MoveMode = 'Tween',
-    TweenSpeed = 65,
+    TweenSpeed = 95, -- Quicker travel to the NEXT needed ordinary machine, not constant hopping.
     PaidSafetyRadius = 10,
     SafeRouteDetours = true,
     MachineRetrySilence = 35,
@@ -193,7 +200,8 @@ local state = {
     CompetitionPowerMargin = 145,
     CompetitionStatFloor = 70,
     CompetitionLossGrowth = 22,
-    Rebirth = true,
+    Rebirth = true, -- Profile Rank Up: normal free six-stat upgrade (game calls this 重生).
+    SuperRebirth = true, -- Profile Rebirth: FULL RESET when max rank/world/champion are reached.
     AutoPets = true,
     AutoEquipment = true,
     Hatch = true,
@@ -207,9 +215,13 @@ local state = {
     Achievements = true,
     SeasonQuests = true,
     Coach = true,
-    BuyFreeCoaches = false,
-    Potion = false,
-    PotionReserve = 1,
+    BuyFreeCoaches = true, -- Unlock only helpful normal-coin trainers; never paid/Robux trainers.
+    CoachCoinBudgetPercent = 22, -- Maximum percent of current normal coins per trainer purchase.
+    Potion = true, -- Use ONLY owned rank-helping muscle/stamina boosts when inactive.
+    PotionReserve = 0, -- Spend owned training boosts; change in Settings to keep a reserve.
+    RankSpeedMode = true, -- Do not interrupt productive training for optional egg batches.
+    SeasonRankShop = true, -- Earned Gym Tokens only, with budget and live-season verification.
+    SeasonTokenBudgetPercent = 35,
     PetMission = true,
     CollectionRewards = true,
     PetIndexRewards = true,
@@ -217,7 +229,7 @@ local state = {
     Mail = true,
     EventRewards = true,
     RedeemCodes = true, -- Official creator-listed free code, once per session
-    MinTrainingSession = 42,
+    MinTrainingSession = 42, -- Legacy saved setting; fast mode uses FastMachineLockSeconds.
     MaxMachineCandidates = 28,
     ChampionFirst = true,
     NoEnergyTimeoutSeconds = 110,
@@ -269,6 +281,11 @@ local nextCompetitionAt = os.clock() + 25
 local worldLast = 1
 local onMachineSince = 0
 local machineStarted = 0
+local fastTrain = {commitment = {stat = 0, focus = '', world = 0, startValue = 0, since = 0}, lastHatchAt = os.clock(), recoveryTrips = 0, recoveryDecayAt = 0}
+fastTrain.promotionInFlight = false
+fastTrain.lastProfileRankAt, fastTrain.lastFullRebirthAt = 0, 0
+fastTrain.nextProfileRankAttempt, fastTrain.nextFullRebirthAttempt = 0, 0
+fastTrain.profileLockUntil = 0
 local hatchSession = false
 local hatchSessionCount = 0
 local nextHatchSession = os.clock() + 60
@@ -410,7 +427,9 @@ end
 local function energyClickBudget()
     local _, maximum = energyValues()
     if not maximum or not state.AutoRecovery then return math.huge end
-    return math.max(0.1, maximum * math.clamp((tonumber(state.EnergyCostBudgetPercent) or 10) / 100, 0.03, 0.5))
+    local base = math.clamp((tonumber(state.EnergyCostBudgetPercent) or 8) / 100, 0.02, 0.5)
+    local adapted = base * (0.72 ^ (fastTrain.recoveryTrips or 0))
+    return math.max(0.1, maximum * math.max(0.02, adapted))
 end
 local function currentTrainingCost()
     local cfg = equipmentConf[trainingId()]
@@ -440,7 +459,9 @@ local function beginEnergyRecovery(reason)
     if energyRecovery.active then return end
     local now = os.clock()
     energyRecovery.active = true
-    energyRecovery.phase = 'treadmill'
+    -- First try to recover without abandoning a productive training machine.
+    -- If the server refuses in-machine regen, recovery switches to the treadmill.
+    energyRecovery.phase = isTraining() and 'on_machine' or 'treadmill'
     energyRecovery.beganAt = now
     energyRecovery.phaseSince = now
     energyRecovery.lastEnergy = current
@@ -907,6 +928,60 @@ local function desiredMuscle()
     end
     return bestId
 end
+-- Fast training: commit to a productive non-VIP machine instead of chasing a
+-- changing weakest-stat estimate every two seconds. Genuine objective changes
+-- (manual focus, a completed champion/rebirth stat, stalls, new world, VIP)
+-- can still force a switch. The maximum commitment is time-bounded.
+function fastTrain.recordTrainingCommitment(stat)
+    fastTrain.commitment.stat = tonumber(stat) or 0
+    fastTrain.commitment.focus = tostring(state.Balanced)
+    fastTrain.commitment.world = world()
+    fastTrain.commitment.startValue = item(fastTrain.commitment.stat)
+    fastTrain.commitment.since = os.clock()
+end
+
+function fastTrain.statObjectiveCompleted(stat)
+    stat = tonumber(stat)
+    if not stat then return false end
+    -- Explicit user-selected single-muscle mode should stay on its machine.
+    if state.Balanced == 'Stamina' or state.Balanced == 'Chest' or state.Balanced == 'Abs'
+        or state.Balanced == 'Back' or state.Balanced == 'Arms' or state.Balanced == 'Legs' then
+        return false
+    end
+    if stat >= 11 and stat <= 15 then
+        local goal, ability = championTrainingGoal()
+        if goal and type(ability) == 'table' then
+            local sum = 0
+            for i = 1, 5 do sum += (tonumber(ability[i]) or 0) end
+            if sum > 0 then
+                local v = tonumber(ability[stat - 10]) or 0
+                local needed = math.max(v * (tonumber(state.CompetitionStatFloor) or 70) / 100,
+                    goal * v / sum)
+                if needed > 0 then return item(stat) >= needed end
+            end
+        end
+    end
+    local cfg = rebirthConf[(tonumber(val(player, 'rebirthCount', 0)) or 0) + 1]
+    local needed = cfg and cfg.need and tonumber(cfg.need[stat - 9])
+    return needed ~= nil and item(stat) >= needed
+end
+
+function fastTrain.keepCurrentMachine(stat, target, held)
+    if stat == target then return true end
+    if not state.FastTraining then
+        local nextCfg = rebirthConf[(tonumber(val(player, 'rebirthCount', 0)) or 0) + 1]
+        local curNeed = nextCfg and nextCfg.need and tonumber(nextCfg.need[stat - 9])
+        return held < math.max(state.ReselectSeconds, state.MinTrainingSession)
+            and (not curNeed or item(stat) < curNeed)
+    end
+    if fastTrain.commitment.world ~= world() then return false end
+    -- Changing a user-selected training focus must take effect promptly.
+    if fastTrain.commitment.focus ~= tostring(state.Balanced) then return false end
+    -- Do not cling to a completed stat while other muscles remain necessary.
+    if held >= 14 and fastTrain.statObjectiveCompleted(stat) then return false end
+    return held < math.clamp(tonumber(state.FastMachineLockSeconds) or 240, 60, 900)
+end
+
 local function availableGear(cfg)
     local gear = 1
     if not cfg or type(cfg.Require) ~= 'table' then return gear end
@@ -1221,6 +1296,7 @@ local function chooseAndStartTrain(targetStat)
         noMachineStreak = 0
         movementFailures = 0
         machineStarted, onMachineSince = os.clock(), os.clock()
+        fastTrain.recordTrainingCommitment(cfg.TrainType)
         lastTrainingId = expectedId
         lastTrainingValue = item(cfg.TrainType)
         lastTrainingGainAt = os.clock()
@@ -1292,15 +1368,28 @@ local function handleEnergyRecovery()
         setStatus(string.format('Energy restored (%.0f%%); resuming smart training', ratio * 100))
         return false
     end
-    -- Exit exhausted muscle equipment promptly, before stall recovery can penalize it.
+    -- Stay on the same machine if the server restores energy while clicks are
+    -- paused. This avoids unnecessary treadmill round-trips. Detect failure and
+    -- fall back to the original VIP-safe treadmill/rest routine.
     if isTraining() then
         local cfg = equipmentConf[trainingId()]
         if not cfg or tonumber(cfg.TrainType) ~= 10 then
+            if energyRecovery.phase == 'on_machine' then
+                local restingFor = now - energyRecovery.phaseSince
+                local recentlyImproving = now - energyRecovery.lastImprovedAt <= 5
+                if restingFor < 8 or (restingFor < 28 and recentlyImproving) then
+                    setStatus(string.format('Resting at current machine: %.0f%% stamina', ratio * 100))
+                    return true
+                end
+                energyRecovery.phase = 'treadmill'
+                energyRecovery.phaseSince = now
+                fastTrain.recoveryTrips = math.min(5, (fastTrain.recoveryTrips or 0) + 1)
+            end
             send('退出训练')
             lastMachine = nil
             onMachineSince = 0
             cooldowns.machineRetry = now
-            setStatus(string.format('Energy %.0f%% - stopping lifts and switching to free treadmill', ratio * 100))
+            setStatus(string.format('Energy %.0f%% - switching to free treadmill for recovery', ratio * 100))
             return true
         end
         -- Treadmills are free of energy cost. If stamina does not rise on one,
@@ -1349,10 +1438,15 @@ local function recoverStalledTraining()
     end
     if current > lastTrainingValue then
         lastTrainingValue, lastTrainingGainAt = current, os.clock()
+        if (fastTrain.recoveryTrips or 0) > 0
+            and os.clock() - math.max(onMachineSince, fastTrain.recoveryDecayAt or 0) > 240 then
+            fastTrain.recoveryTrips = math.max(0, fastTrain.recoveryTrips - 1)
+            fastTrain.recoveryDecayAt = os.clock()
+        end
         return
     end
     local stalledFor = os.clock() - lastTrainingGainAt
-    if stalledFor > 42 then
+    if stalledFor > 75 then
         send('退出训练')
         machineFails[lastMachine] = os.clock() + 60
         lastMachine = nil
@@ -1360,7 +1454,7 @@ local function recoverStalledTraining()
         setStatus('No confirmed training gain; changing normal machine')
         return
     end
-    if stalledFor > 20 and os.clock() > trainingBackoffUntil and state.AutoGear then
+    if stalledFor > 22 and os.clock() > trainingBackoffUntil and state.AutoGear then
         local index = tonumber(val(lastMachine,'TrainGear',1)) or 1
         if cfg.EquipmentType ~= 2 and index > 1 then
             send('设置挡位', {Index = index - 1, Count = 1})
@@ -1375,40 +1469,122 @@ local function recoverStalledTraining()
                 end
             end
         end
-        trainingBackoffUntil = os.clock() + 13
-        setStatus('Training stalled; testing lighter weight and confirming gains')
+        trainingBackoffUntil = os.clock() + 35
+        setStatus('Training stalled; testing lighter weight before changing machines')
     end
 end
-local function canAutoRebirth()
-    -- Avoid depending on a potentially decompiler-damaged helper implementation.
-    -- The original game's RebirthData.IsCanRebirth checks exactly these six Bag IDs.
-    local nextLevel = (tonumber(val(player, 'rebirthCount', 0)) or 0) + 1
-    local cfg = rebirthConf[nextLevel]
-    if not cfg or type(cfg.need) ~= 'table' then return false end
+-- In the game's Profile screen "Rank Up" calls the misleadingly named
+-- RemoteFunction("重生"). The separate "Rebirth" button calls "SuperRebirth"
+-- and resets world/champion/rank progression. Treat these as distinct actions.
+fastTrain.SuperRebirthData = safe('Profile rebirth requirements', function()
+    local module = Tool:FindFirstChild('SuperRebirthData')
+    return module and require(module)
+end)
+function fastTrain.profileRank()
+    return tonumber(val(player, 'rebirthCount', 0)) or 0
+end
+function fastTrain.profileRebirths()
+    return tonumber(val(player, 'superRebirthCount', 0)) or 0
+end
+function fastTrain.canAutoRebirth()
+    -- Game's RebirthData.IsCanRebirth: all six Bag values must reach the
+    -- NEXT rank's requirement. This is a normal, free Profile Rank Up.
+    local cfg = rebirthConf[fastTrain.profileRank() + 1]
+    if not cfg or type(cfg.need) ~= 'table' or #cfg.need ~= 6 then return false end
     for index, required in ipairs(cfg.need) do
-        if item(index + 9) < (tonumber(required) or math.huge) then
-            return false
-        end
+        local amount = tonumber(required)
+        if not amount or item(index + 9) < amount then return false end
     end
     return true
 end
-local function rebirth()
-    if not throttle('rebirth', 12) or not canAutoRebirth() then return end
-    cancelTravel()
-    if isTraining() then send('退出训练'); task.wait(0.2) end
-    setStatus('Rebirthing: all stat requirements met')
-    local result = invoke('重生')
-    if result == true then
-        lastMachine = nil; machineStarted = 0
-        energyRecovery.active = false
-        onMachineSince = 0
-        fallbackTrainingStat, fallbackTrainingUntil = 0, 0
-        machineFails = {}
-        cooldowns.machineRetry = os.clock() + 3
-    else
-        setStatus('Rebirth request not accepted')
+function fastTrain.canAutoProfileRebirth()
+    -- Use the live game's exact gate so the script cannot trigger a full reset
+    -- merely because a stale UI label looks like it is unlocked.
+    if not fastTrain.SuperRebirthData or type(fastTrain.SuperRebirthData.CanSuperRebirth) ~= 'function' then
+        return false
     end
+    local ok, allowed = pcall(fastTrain.SuperRebirthData.CanSuperRebirth, player)
+    return ok and allowed == true
 end
+function fastTrain.clearProfileUpgradeTraining()
+    cancelTravel()
+    lastMachine = nil
+    machineStarted = 0
+    onMachineSince = 0
+    lastTrainingId = 0
+    lastTrainingGainAt = os.clock()
+    fallbackTrainingStat, fallbackTrainingUntil = 0, 0
+    energyRecovery.active = false
+    machineFails = {}
+    fastTrain.commitment.stat = 0
+    cooldowns.machineRetry = os.clock() + 1.5
+end
+function fastTrain.tryInstantProfileUpgrade()
+    if fastTrain.promotionInFlight or not running or not state.Master
+        or os.clock() < fastTrain.profileLockUntil then return end
+    -- Do not interrupt a live competition or another active movement/egg
+    -- transaction. Rank/return-state eligibility is rechecked very frequently.
+    if isCompeting() or contestByUs or busy or hatchSession then return end
+    local now = os.clock()
+    local super = state.SuperRebirth and now >= fastTrain.nextFullRebirthAttempt and fastTrain.canAutoProfileRebirth()
+    local rank = state.Rebirth and now >= fastTrain.nextProfileRankAttempt and fastTrain.canAutoRebirth()
+    if not super and not rank then return end
+    local before = (super and fastTrain.profileRebirths() or fastTrain.profileRank())
+    local action = super and 'SuperRebirth' or '重生'
+    fastTrain.promotionInFlight = true
+    -- Don't race the training click loop against the game resetting stats.
+    if isTraining() then
+        send('退出训练')
+        task.wait(0.12)
+    end
+    local stillAllowed = running and state.Master and not isCompeting() and not contestByUs
+        and (super and state.SuperRebirth and fastTrain.canAutoProfileRebirth()
+            or (not super and state.Rebirth and fastTrain.canAutoRebirth()))
+    if not stillAllowed then
+        fastTrain.promotionInFlight = false
+        return
+    end
+    setStatus(super and 'Profile Rebirth available - upgrading now'
+        or 'Profile Rank Up available - upgrading now')
+    local ok, result = pcall(invoke, action)
+    -- Do not send multiple requests while server replication is catching up.
+    local deadline = os.clock() + 2.0
+    while running and os.clock() < deadline do
+        local count = (super and fastTrain.profileRebirths() or fastTrain.profileRank())
+        if count > before then break end
+        task.wait(0.1)
+    end
+    local after = super and fastTrain.profileRebirths() or fastTrain.profileRank()
+    if super then
+        fastTrain.nextFullRebirthAttempt = os.clock() + (after > before and 6 or 8)
+    else
+        fastTrain.nextProfileRankAttempt = os.clock() + (after > before and 4.5 or 6)
+    end
+    if after > before then
+        -- Native Profile Rank Up runs a ~4-second character animation.
+        fastTrain.profileLockUntil = os.clock() + (super and 5 or 4.2)
+        fastTrain.clearProfileUpgradeTraining()
+        if super then
+            fastTrain.lastFullRebirthAt = os.clock()
+            fastTrain.nextProfileRankAttempt = os.clock() + 5
+            nextCompetitionAt = os.clock() + 12
+            setStatus('Profile Rebirth complete - restarting normal progression')
+        else
+            fastTrain.lastProfileRankAt = os.clock()
+            setStatus('Profile Rank Up complete - training next rank')
+        end
+    elseif not ok or result == false then
+        setStatus(super and 'Rebirth request rejected; retrying after cooldown'
+            or 'Rank Up request rejected; retrying after cooldown')
+    else
+        -- Server may accept but delay replicated count changes. Never assume
+        -- success based on a truthy response alone.
+        setStatus(super and 'Rebirth pending server confirmation'
+            or 'Rank Up pending server confirmation')
+    end
+    fastTrain.promotionInFlight = false
+end
+
 local function advanceWorld()
     if not throttle('world', 12) or isCompeting() or busy or hatchSession then return end
     local max = bestUnlockedWorld()
@@ -1508,8 +1684,8 @@ local function hatchEgg()
 end
 
 local function equipBest()
-    if state.AutoPets and throttle('petEquip', 65) then send('装备最佳宠物') end
-    if state.AutoEquipment and throttle('equipmentEquip', 85) then send('装备最佳装备') end
+    if state.AutoPets and throttle('petEquip', 30) then send('装备最佳宠物') end
+    if state.AutoEquipment and throttle('equipmentEquip', 35) then send('装备最佳装备') end
     if state.AutoFuse and throttle('petFuse', 170) then send('FuseAllPet') end
 end
 local function claimRewards()
@@ -1816,70 +1992,170 @@ local function ownedCoaches()
     end
     return result
 end
+-- Only rank-growth effects are strongly valued. The Coach screen shows
+-- 1=muscle growth, 2=stamina growth, 4=competition coins and 6=energy cost.
 local function coachScore(cfg)
     local score = 0
     for i, tp in ipairs(cfg.CoachBuffType or {}) do
         local amount = tonumber(cfg.CoachBuffNumber and cfg.CoachBuffNumber[i]) or 0
-        if tp == 1 then score += amount * 1.1
-        elseif tp == 2 then score += amount
-        elseif tp == 3 then score += amount * 0.75
-        elseif tp == 6 then score += amount * 0.6
-        elseif tp == 4 then score += amount * 0.2 end
+        if tp == 1 then score += amount
+        elseif tp == 2 then score += amount * 0.35
+        elseif tp == 3 then score += amount * 0.2
+        elseif tp == 6 then score += amount * 0.3
+        elseif tp == 4 then score += amount * 0.08 end
     end
     return score
 end
+-- Stores cannot be trusted to distinguish Robux currency from ordinary
+-- currency by a displayed price. Use BOTH the explicit normal-coin type and
+-- an empty paid-product tag, and verify the native unlock task locally.
+local function isFreeCoinTrainer(cfg)
+    return type(cfg) == 'table' and tonumber(cfg.IsEnabled) == 1
+        and tonumber(cfg.UnlockCoinType) == 1
+        and tostring(cfg.OnlyTag or '') == ''
+        and tonumber(cfg.UnlockCoinNumber) ~= nil
+        and tonumber(cfg.UnlockCoinNumber) > 0
+end
 local function autoCoach()
-    if not state.Coach or not throttle('coach', 80) then return end
+    if not state.Coach or not throttle('coach', 20) then return end
     local owns = ownedCoaches()
-    local best, bestScore, currently = nil, -math.huge, nil
+    local best, bestScore, currentScore = nil, -math.huge, -math.huge
     for id, entry in pairs(owns) do
         local cfg = coachConf[id]
-        if cfg and cfg.IsEnabled ~= 0 then
+        if cfg and tonumber(cfg.IsEnabled) == 1 then
             local score = coachScore(cfg)
             if score > bestScore then best, bestScore = id, score end
-            if tonumber(entry.using) == 1 then
-                currently = math.max(currently or -math.huge, score)
-            end
+            if tonumber(entry.using) == 1 then currentScore = math.max(currentScore, score) end
         end
     end
-    if best and (not currently or bestScore > currently) and tonumber(owns[best].using) ~= 1 then
+    if best and bestScore > currentScore + 0.01 and tonumber(owns[best].using) ~= 1
+        and throttle('coachEquip', 20) then
+        -- Equipping an owned coach needs no shop visit or coins.
         invoke('装备教练', best)
-        setStatus('Equipping best owned free/earned coach '..best)
+        setStatus('Equipped strongest rank-growth trainer')
     end
-    if not state.BuyFreeCoaches then return end
-    -- Only normal-money coaches whose prerequisite is already completed.
-    local bestBuy, bestGain, bestPrice = nil, 0, 0
+    if not state.BuyFreeCoaches or not GetDataModule
+        or type(GetDataModule.IsFinishUnlockTask) ~= 'function' then return end
+    if not throttle('coachBuy', 75) then return end
+    local money = currency()
+    local maxSpend = money * math.clamp(tonumber(state.CoachCoinBudgetPercent) or 22, 0, 60)/100
+    if maxSpend <= 0 then return end
+    -- If the next ordinary world is already unlockable, let that transaction
+    -- consume the coins first; avoid delaying world advancement with shopping.
+    local nextWorld = bestUnlockedWorld() + 1
+    local progress = tonumber(val(player:FindFirstChild('Record'), '解锁世界', 0)) or 0
+    if state.World and worldConf[nextWorld] and progress >= nextWorld
+        and money >= worldCost(nextWorld) then return end
+    local chosen, chosenPriority, chosenPrice = nil, 0, 0
     for id, cfg in pairs(coachConf) do
-        if cfg.IsEnabled ~= 0 and not owns[id] and tonumber(cfg.UnlockCoinType) == 1 then
+        if isFreeCoinTrainer(cfg) and not owns[id] then
             local price = tonumber(cfg.UnlockCoinNumber) or math.huge
-            if price > 0 and price <= currency() * 0.03 then
-                local taskReady = GetDataModule and safe('coach prerequisite',function()
-                    return GetDataModule.IsFinishUnlockTask(player,cfg.UnlockType,cfg.UnlockTypeNumber,false)
+            local growthGain = coachScore(cfg) - math.max(currentScore, 0)
+            if price <= maxSpend and growthGain > 0 then
+                local unlocked = safe('free trainer prerequisites', function()
+                    return GetDataModule.IsFinishUnlockTask(
+                        player, cfg.UnlockType, cfg.UnlockTypeNumber, false)
                 end)
-                local improvement = coachScore(cfg) - math.max(0,currently or 0)
-                if taskReady == true and improvement > bestGain then
-                    bestBuy,bestGain,bestPrice = id,improvement,price
+                if unlocked == true then
+                    -- Value-per-coin weighting prioritises cheap early rank boosts.
+                    local priority = growthGain / math.max(1, math.log(price + 10))
+                    if priority > chosenPriority then
+                        chosen, chosenPriority, chosenPrice = id, priority, price
+                    end
                 end
             end
         end
     end
-    if bestBuy and throttle('coachBuy', 300) then
-        local ok = invoke('解锁教练', bestBuy)
-        if ok == true then setStatus('Unlocked earned-money coach '..bestBuy) end
+    if chosen then
+        local before = currency()
+        local success = invoke('解锁教练', chosen)
+        -- The server and inventory are authoritative; a remote response by
+        -- itself isn't proof of purchase. Do not retry in a tight loop.
+        task.delay(1, function()
+            if running and (currency() < before or ownedCoaches()[chosen]) then
+                setStatus('Unlocked normal-coin trainer '..tostring(chosen))
+            end
+        end)
+    end
+end
+-- This separate seasonal shop consumes earned Gym Tokens (Bag[33]),
+-- never Robux. The server's SeasonShopConfig validates that the event is
+-- active and that each item can be bought using these tokens.
+fastTrain.seasonShopConfig = safe('season shop config', function()
+    local root = RS:FindFirstChild('Global game configuration')
+    local shop = root and root:FindFirstChild('SeasonShop')
+    local module = shop and shop:FindFirstChild('SeasonShopConfig')
+    return module and require(module)
+end)
+function fastTrain.autoSeasonRankShop()
+    if not state.SeasonRankShop or not state.Coach or not throttle('seasonRankShop', 120) then return end
+    if not fastTrain.seasonShopConfig or type(fastTrain.seasonShopConfig.IsSeasonShopActive) ~= 'function'
+        or type(fastTrain.seasonShopConfig.GetItems) ~= 'function' then return end
+    local active = safe('season shop availability', fastTrain.seasonShopConfig.IsSeasonShopActive)
+    if active ~= true then return end
+    local tokenId = tonumber(fastTrain.seasonShopConfig.CURRENCY_ITEM_ID)
+    if not tokenId or tokenId ~= 33 then return end
+    local tokens = item(tokenId)
+    local budget = tokens * math.clamp(tonumber(state.SeasonTokenBudgetPercent) or 35, 0, 70)/100
+    if budget <= 0 then return end
+    local inventory = ownedCoaches()
+    local equippedPower = 0
+    for id, entry in pairs(inventory) do
+        local cfg = coachConf[id]
+        if cfg and tonumber(entry.using) == 1 then
+            equippedPower = math.max(equippedPower, coachScore(cfg))
+        end
+    end
+    local stock = safe('season rank offers', fastTrain.seasonShopConfig.GetItems)
+    if type(stock) ~= 'table' then return end
+    local best, bestPriority = nil, 0
+    for _, offer in ipairs(stock) do
+        -- Other categories include Robux token bundles, event pets and
+        -- expensive or destructive offers. Only rank-improving trainers.
+        if type(offer) == 'table' and offer.Category == 'Trainers'
+            and offer.Config == 'coachConf' and offer.IsRobuxPurchase ~= true
+            and not offer.SharedPoolOnlyTag then
+            local id = tonumber(offer.ID)
+            local cost = tonumber(offer.GymTokenPrice)
+            local cfg = id and coachConf[id]
+            if cfg and tonumber(cfg.IsEnabled) == 1 and not inventory[id]
+                and cost and cost > 0 and cost <= budget then
+                local gain = coachScore(cfg) - equippedPower
+                if gain > 0 then
+                    local priority = gain/math.log(cost + 10)
+                    if priority > bestPriority then best, bestPriority = offer, priority end
+                end
+            end
+        end
+    end
+    if not best then return end
+    local remotes = RS:FindFirstChild('Remotes')
+    local purchase = remotes and remotes:FindFirstChild('TryBuySeasonShopItem')
+    if not purchase or not purchase:IsA('RemoteFunction') then return end
+    local outcome = safe('season shop earned trainer purchase', function()
+        return purchase:InvokeServer(best.Key)
+    end)
+    if type(outcome) == 'table' and outcome.ok == true then
+        setStatus('Unlocked better rank-growth trainer using earned Gym Tokens')
+        cooldowns.coach = 0 -- Equip on the next trainer update.
     end
 end
 local function useOwnedPotions()
-    if not state.Potion or not throttle('potions', 35) then return end
+    if not state.Potion or not state.Train or not throttle('potions', 25) then return end
+    if fastTrain.promotionInFlight or isCompeting() then return end
     local buffs = player:FindFirstChild('BUFF')
     if not buffs then return end
-    -- Buff values store remaining duration; never waste a potion while active.
-    for _, id in ipairs({101, 201, 301, 501}) do
+    local reserve = math.clamp(tonumber(state.PotionReserve) or 0, 0, 10)
+    -- 101: muscle-training boost, 201: reduced stamina consumption.
+    -- All regular shop listings for these are Robux offers: NEVER buy them.
+    for _, id in ipairs({101, 201}) do
         local count = item(id)
-        if count > (tonumber(state.PotionReserve) or 1) and buffConf[id] then
-            local active = tonumber(val(buffs, tostring(id), 0)) or 0
-            if active <= 0 then
-                send('使用药水', id)
-                setStatus('Activated owned, inactive potion '..id)
+        if count > reserve and buffConf[id] then
+            local buff = buffs:FindFirstChild(tostring(id))
+            local remaining = buff and tonumber(buff.Value)
+            if remaining and remaining <= 0 and throttle('useTrainingPotion_' .. id, 90) then
+                send('使用药水', id) -- Game's Bag UI uses this exact action.
+                setStatus('Using owned rank-training boost '..id)
                 return
             end
         end
@@ -2037,6 +2313,7 @@ end
 
 -- Highest-priority cadence: use the game's own normal click remotes.
 startLoop('training clicks', function() return 1 / math.clamp(state.TrainClicksPerSecond, 2, 12) end, function()
+    if fastTrain.promotionInFlight or os.clock() < fastTrain.profileLockUntil then return end
     if not state.Train or isCompeting() or not isTraining() then return end
     -- Fail closed: only click a verified, ordinary machine that belongs
     -- to the current training session.
@@ -2071,7 +2348,13 @@ startLoop('competition clicks', function() return 1 / math.clamp(state.Competiti
         end
     end
 end)
-startLoop('progression', function() return 2.3 end, function()
+-- Run a lightweight eligibility check five times per second. Most iterations
+-- cost six Bag reads, with the full reset requirements checked by the native module.
+startLoop('instant Profile upgrades', function() return 0.2 end, function()
+    fastTrain.tryInstantProfileUpgrade()
+end)
+startLoop('progression', function() return 1.25 end, function()
+    if fastTrain.promotionInFlight or os.clock() < fastTrain.profileLockUntil then return end
     competitionOutcomeTick()
     controlNativeAutoClick(state.Train) -- avoid overlapping native training clicks
     if state.Competition then
@@ -2088,9 +2371,8 @@ startLoop('progression', function() return 2.3 end, function()
     if state.World then advanceWorld() end
     recoverStalledTraining()
     if energyRecovery.active then return end
-    local championPending = state.ChampionFirst and state.Competition and state.CompeteForWorld
-        and not championCleared()
-    if state.Rebirth and canAutoRebirth() and not championPending then rebirth(); return end
+    -- Profile upgrades are handled by the separate fast priority loop.
+    -- Never gate Rank Up behind world champions or stamina recovery.
     if state.Competition and not isCompeting() and os.clock() >= nextCompetitionAt then
         compete()
         if isCompeting() then return end
@@ -2122,11 +2404,10 @@ startLoop('progression', function() return 2.3 end, function()
             if cfg then
                 local held = os.clock() - onMachineSince
                 local curStat = tonumber(cfg.TrainType)
-                local nextCfg = rebirthConf[(tonumber(val(player, 'rebirthCount', 0)) or 0) + 1]
-                local curNeed = nextCfg and nextCfg.need and tonumber(nextCfg.need[curStat - 9])
-                if curStat == target or
-                   (held < math.max(state.ReselectSeconds, state.MinTrainingSession) and
-                    (not curNeed or item(curStat) < curNeed)) then
+                local owner = tonumber(val(lastMachine, 'OwnerID', 0)) or 0
+                if (owner == player.UserId or owner == 0)
+                    and tonumber(val(lastMachine,'EquipmentID',0)) == trainingId()
+                    and fastTrain.keepCurrentMachine(curStat, target, held) then
                     adjustCurrentGear()
                     return
                 end
@@ -2140,12 +2421,17 @@ startLoop('progression', function() return 2.3 end, function()
                 setStatus('Exited VIP machine')
                 return
             end
-            if cfg and tonumber(cfg.TrainType) == target and current and not isVipMachine(current) then
+            if cfg and current and not isVipMachine(current)
+                and tonumber(val(current, 'EquipmentID', 0)) == trainingId()
+                and ((tonumber(val(current, 'OwnerID', 0)) or 0) == player.UserId
+                    or ((tonumber(val(current, 'OwnerID', 0)) or 0) == 0
+                        and tostring(currentName) == current.Name)) then
                 lastMachine = current
                 machineStarted = os.clock()
                 onMachineSince = os.clock()
+                fastTrain.recordTrainingCommitment(cfg.TrainType)
                 lastTrainingId = trainingId()
-                lastTrainingValue = item(target)
+                lastTrainingValue = item(cfg.TrainType)
                 lastTrainingGainAt = os.clock()
                 adjustCurrentGear()
                 return
@@ -2181,6 +2467,8 @@ end)
 startLoop('pet and equipment', function() return 5 end, function()
     equipBest()
     autoCoach()
+    fastTrain.autoSeasonRankShop()
+    useOwnedPotions()
 end)
 startLoop('rewards', function() return 8 end, function()
     if not state.AutoRewards then return end
@@ -2193,9 +2481,15 @@ startLoop('rewards', function() return 8 end, function()
     claimMail()
     claimFreeEventRewards()
     redeemOfficialCode()
-    useOwnedPotions()
 end)
 startLoop('eggs', function() return 1.2 end, function()
+    if fastTrain.promotionInFlight or os.clock() < fastTrain.profileLockUntil then return end
+    if state.RankSpeedMode and state.Train and isTraining() and not hatchSession then
+        -- Keep profitable training uninterrupted; hatching can start between
+        -- ranks, during idle downtime or when rank priority is switched off.
+        nextHatchSession = math.max(nextHatchSession, os.clock() + 18)
+        return
+    end
     if not state.Hatch then
         hatchSession = false
         nextHatchSession = os.clock() + 60
@@ -2209,13 +2503,26 @@ startLoop('eggs', function() return 1.2 end, function()
     if isCompeting() or contestByUs or busy or os.clock() < nextHatchSession or os.clock() < (cooldowns.competitionPending or 0) then return end
     if (cooldowns.hatch or 0) > os.clock() then return end
     if not hatchSession then
-        if isTraining() and (os.clock() - onMachineSince) < math.max(20, tonumber(state.MinTrainingSession) or 42) then
+        -- Optional pet hatching must not sabotage the main training loop.
+        -- One four-egg batch per longer break; never leave a new productive
+        -- machine until it has had enough useful training time.
+        if state.FastTraining then
+            if os.clock() - fastTrain.lastHatchAt < (tonumber(state.EggBreakSeconds) or 600) then
+                nextHatchSession = os.clock() + 45
+                return
+            end
+            if isTraining() and (os.clock() - onMachineSince) < (tonumber(state.EggBreakSeconds) or 600) then
+                nextHatchSession = os.clock() + 45
+                return
+            end
+        elseif isTraining() and (os.clock() - onMachineSince) < math.max(20, tonumber(state.MinTrainingSession) or 42) then
             nextHatchSession = os.clock() + 25
             return
         end
         if not getEggChoice() then nextHatchSession = os.clock() + 35; return end
         hatchSession = true
         hatchSessionCount = 0
+        fastTrain.lastHatchAt = os.clock()
     end
     if isTraining() then
         send('退出训练')
@@ -2351,15 +2658,23 @@ farm:CreateSection('Training')
 toggle(farm, 'Train', 'Auto Train')
 toggle(farm, 'AutoGear', 'Auto Equip Best Weights')
 toggle(farm, 'AutoRecovery', 'Auto Recover Stamina')
+toggle(farm, 'FastTraining', 'Stay on Training Machines')
 farm:CreateSection('Progression')
 toggle(farm, 'World', 'Auto Unlock Worlds')
 toggle(farm, 'Competition', 'Smart Competitions')
-toggle(farm, 'Rebirth', 'Auto Rebirth', 'Rebirth resets your training stats.')
+toggle(farm, 'Rebirth', 'Instant Rank Up', 'Automatically rank up when all six training stats qualify.')
+toggle(farm, 'SuperRebirth', 'Auto Rebirth (Full Reset)', 'At maximum rank, world and champion: resets rank, worlds and training.')
 farm:CreateSection('Pets & Rewards')
 toggle(farm, 'AutoPets', 'Equip Best Pets')
 toggle(farm, 'AutoEquipment', 'Equip Best Equipment')
 toggle(farm, 'Hatch', 'Auto Hatch Eggs')
+toggle(farm, 'RankSpeedMode', 'Prioritize Fast Ranks', 'Keep productive training sessions uninterrupted instead of travelling to eggs.')
 toggle(farm, 'AutoRewards', 'Claim Free Rewards')
+farm:CreateSection('Rank Boosts')
+toggle(farm, 'Coach', 'Equip Best Training Coach')
+toggle(farm, 'BuyFreeCoaches', 'Buy Better Coin Trainers', 'Spends only normal coins within your spending limit. Never buys paid trainers.')
+toggle(farm, 'Potion', 'Use Owned Training Boosts', 'Uses your owned muscle and stamina potions; never purchases Robux boosts.')
+toggle(farm, 'SeasonRankShop', 'Season Token Trainer Upgrades', 'Buy better trainers with earned Gym Tokens while a season shop is active.')
 
 local settings = tab('Settings')
 settings:CreateSection('Preferences')
@@ -2368,9 +2683,13 @@ dropdown(settings, 'Balanced', 'Training Focus',
 toggle(settings, 'StaminaTraining', 'Train Stamina for Rebirth')
 slider(settings, 'CompetitionPowerMargin', 'Competition Safety', 125, 230, 5, '%')
 slider(settings, 'HatchBudgetPercent', 'Egg Spending Limit', 1, 30, 1, '%')
+slider(settings, 'CoachCoinBudgetPercent', 'Coin Trainer Spending Limit', 5, 50, 1, '%')
+slider(settings, 'PotionReserve', 'Training Boosts to Keep', 0, 5, 1, '')
+slider(settings, 'SeasonTokenBudgetPercent', 'Season Token Spending Limit', 5, 70, 5, '%')
 settings:CreateSection('Movement')
 dropdown(settings, 'MoveMode', 'Movement', {'Tween','Walk','None'})
 slider(settings, 'TweenSpeed', 'Tween Speed', 20, 130, 5, ' studs/s')
+slider(settings, 'FastMachineLockSeconds', 'Machine Session Length', 60, 600, 30, 's')
 settings:CreateLabel('VIP and paid-area avoidance stays enabled automatically.')
 settings:CreateSection('Server Rejoins')
 toggle(settings, 'AutoResume', 'Auto Resume After Server Change')
@@ -2524,12 +2843,14 @@ button(configsTab, 'Delete Selected Profile', function()
 end)
 
 
-shared.PuckAFK_GymStar_Instance = {Unload = unload, State = state, Recovery = energyRecovery, Window = window, Version = '1.6.4'}
+shared.PuckAFK_GymStar_Instance = {Unload = unload, State = state, Recovery = energyRecovery, Window = window, Version = '1.6.7'}
 
 -- Compact live information. Don't display machine IDs, errors, counters or raw debug state.
 local function simpleActivity()
     if not state.Master then return 'Paused' end
     if isCompeting() then return 'Competing' end
+    if fastTrain.promotionInFlight then return 'Upgrading Profile' end
+    if os.clock() < fastTrain.profileLockUntil then return 'Finishing Profile upgrade' end
     if energyRecovery.active then return 'Recovering stamina' end
     if hatchSession then return 'Hatching eggs' end
     if isTraining() then return 'Training' end
@@ -2545,8 +2866,9 @@ task.spawn(function()
         safe('status display', function()
             if activityLabel then activityLabel:Set('Status: ' .. simpleActivity()) end
             if worldLabel then
-                worldLabel:Set(string.format('World %d | Coins %.3g | Rebirths %s',
-                    world(), currency(), tostring(val(player, 'rebirthCount', 0))))
+                worldLabel:Set(string.format('World %d | Coins %.3g | Rank %s | Rebirths %s',
+                    world(), currency(), tostring(val(player, 'rebirthCount', 0)),
+                    tostring(val(player, 'superRebirthCount', 0))))
             end
             if statsLabel then
                 local _, _, ratio = energyValues()
@@ -2559,7 +2881,7 @@ task.spawn(function()
         task.wait(2)
     end
 end)
-notify('PuckAFK Gym Star', 'Ready. Enable Smart Autofarm in Home.')
+notify('PuckAFK Gym Star', 'Fast ranks, coin trainer upgrades and owned training boosts ready.')
 ]===]
 local run,err=loadstring(env.PuckAFK_GymStar_ResumeSource)
 if run then run() else warn('[PuckAFK Gym Star] Compile error: '..tostring(err)) end
